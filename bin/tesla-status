@@ -1,0 +1,485 @@
+#!/bin/bash
+# Read-only Tesla status for the home-screen widget.
+#
+# Talks to Tesla's owner API. Never calls wake_up. A parked, awake car is
+# read at most once every 15 minutes, so this tile cannot be what keeps it
+# from sleeping. Asleep and offline cars return the last reading.
+#
+# The refresh token is the whole account. It lives only in
+# ~/.config/omarchy-tesla/refresh-token (mode 600), never in the widget file
+# and never on a command line.
+
+set -uo pipefail
+umask 077
+
+readonly OWNER_API="https://owner-api.teslamotors.com/api/1"
+readonly OWNER_API_CN="https://owner-api.vn.cloud.tesla.cn/api/1"
+readonly AUTH="https://auth.tesla.com/oauth2/v3"
+readonly AUTH_CN="https://auth.tesla.cn/oauth2/v3"
+readonly CLIENT_ID="ownerapi"
+readonly SCOPE="openid email offline_access"
+# Token calls must be TLS 1.3. Tesla records the handshake in the token and
+# the owner API rejects TLS 1.2 with a message that looks like "use the Fleet
+# API". The token is fine; the handshake was not.
+readonly TLS_PIN="--tlsv1.3"
+readonly APP_UA="Mozilla/5.0 (Linux; Android 10; Pixel 3) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/120.0 Mobile Safari/537.36"
+readonly APP_TAG="TeslaApp/4.30.6"
+
+CONFIG_DIR="${OMARCHY_TESLA_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-tesla}"
+CACHE_DIR="${OMARCHY_TESLA_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-tesla}"
+readonly API_ERROR_FILE="$CACHE_DIR/.last-error"
+readonly PARK_THROTTLE=900
+readonly DRIVE_THROTTLE=10
+readonly CHARGE_THROTTLE=45
+
+die() { printf 'tesla-status: %s\n' "$*" >&2; exit 1; }
+
+fail_json() {
+  jq -cn --arg error "${1:-not signed in}" --arg hint "${2-}" \
+    '{ready: false, error: $error, hint: (if $hint == "" then null else $hint end)}'
+  exit 0
+}
+
+need() { command -v "$1" >/dev/null 2>&1 || die "$1 is required but not installed"; }
+
+need curl
+need jq
+need openssl
+
+mkdir -p "$CONFIG_DIR" "$CACHE_DIR/cars"
+chmod 700 "$CONFIG_DIR" "$CACHE_DIR" "$CACHE_DIR/cars" 2>/dev/null || true
+
+now() { date +%s; }
+
+# Only plain digits reach arithmetic. A forged expires_in must not be eval'd.
+number_or() {
+  local value="$1" fallback="$2"
+  case "$value" in
+    ''|*[!0-9]*) printf '%s' "$fallback"; return 0 ;;
+  esac
+  [ "${#value}" -le 12 ] || { printf '%s' "$fallback"; return 0; }
+  printf '%s' "$((10#$value))"
+}
+
+write_private() {
+  local path="$1" tmp
+  tmp=$(mktemp "${path}.XXXXXX") || return 1
+  cat > "$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 600 "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$path"
+}
+
+read_first_line() {
+  [ -r "$1" ] || return 1
+  local line
+  line=$(head -n 1 "$1" | tr -d '\r\n')
+  [ -n "$line" ] || return 1
+  printf '%s' "$line"
+}
+
+jwt_issuer() {
+  local token="$1" payload padding
+  payload=${token#*.}
+  [ "$payload" != "$token" ] || return 1
+  payload=${payload%%.*}
+  case "$payload" in ''|*[!A-Za-z0-9_-]*) return 1 ;; esac
+  case $((${#payload} % 4)) in
+    0) padding="" ;;
+    2) padding="==" ;;
+    3) padding="=" ;;
+    *) return 1 ;;
+  esac
+  printf '%s%s' "$payload" "$padding" | tr '_-' '/+' \
+    | openssl base64 -d -A 2>/dev/null \
+    | jq -er '.iss | strings | select(length > 0)' 2>/dev/null
+}
+
+auth_for() {
+  case "$(jwt_issuer "$1" || true)" in
+    https://auth.tesla.cn/oauth2/v3) printf '%s' "$AUTH_CN" ;;
+    *) printf '%s' "$AUTH" ;;
+  esac
+}
+
+owner_api_for() {
+  case "$(jwt_issuer "$1" || true)" in
+    https://auth.tesla.cn/oauth2/v3) printf '%s' "$OWNER_API_CN" ;;
+    *) printf '%s' "$OWNER_API" ;;
+  esac
+}
+
+refresh_token() {
+  if [ -n "${TESLA_REFRESH_TOKEN:-}" ]; then printf '%s' "$TESLA_REFRESH_TOKEN"; return 0; fi
+  read_first_line "$CONFIG_DIR/refresh-token"
+}
+
+# Mint an access token. The refresh token is written on stdin, never as an
+# argument, because arguments are world-readable in /proc.
+mint_access_token() {
+  local refresh="$1" auth response token expires_in new_refresh
+  [ -n "$refresh" ] || return 1
+  auth=$(auth_for "$refresh")
+  response=$(
+    jq -cRn --arg id "$CLIENT_ID" --arg scope "$SCOPE" \
+      '{grant_type: "refresh_token", client_id: $id, refresh_token: input, scope: $scope}' \
+      <<<"$refresh" |
+      curl -sS $TLS_PIN -m 20 -X POST "$auth/token" \
+        -H "Content-Type: application/json" \
+        -H "User-Agent: $APP_UA" \
+        -H "X-Tesla-User-Agent: $APP_TAG" \
+        --data-binary @-
+  ) || return 1
+  token=$(printf '%s' "$response" | jq -r '.access_token // empty' 2>/dev/null) || true
+  [ -n "$token" ] || return 1
+  expires_in=$(number_or "$(printf '%s' "$response" | jq -r '.expires_in // empty' 2>/dev/null)" 28800)
+  new_refresh=$(printf '%s' "$response" | jq -r '.refresh_token // empty' 2>/dev/null) || true
+  write_private "$CONFIG_DIR/access-token" <<<"$token"
+  write_private "$CONFIG_DIR/access-token-expires" <<<"$(( $(now) + expires_in ))"
+  [ -n "$new_refresh" ] && write_private "$CONFIG_DIR/refresh-token" <<<"$new_refresh"
+  printf '%s' "$token"
+}
+
+access_token() {
+  if [ -n "${TESLA_ACCESS_TOKEN:-}" ]; then printf '%s' "$TESLA_ACCESS_TOKEN"; return 0; fi
+  local token expires
+  token=$(read_first_line "$CONFIG_DIR/access-token" 2>/dev/null) || token=""
+  expires=$(number_or "$(read_first_line "$CONFIG_DIR/access-token-expires" 2>/dev/null || true)" 0)
+  if [ -n "$token" ] && [ "$expires" -gt "$(( $(now) + 60 ))" ]; then
+    printf '%s' "$token"
+    return 0
+  fi
+  local refresh
+  refresh=$(refresh_token) || return 1
+  mint_access_token "$refresh"
+}
+
+api_error() { cat "$API_ERROR_FILE" 2>/dev/null || true; }
+
+api_hint() {
+  case "$(api_error)" in
+    "owner API retired"*) printf '%s' "this account has to use Tesla's Fleet API, which this tile does not speak" ;;
+    "not signed in") printf '%s' "paste a refresh token with: tesla-status token" ;;
+    *) printf '' ;;
+  esac
+}
+
+# GET only. There is no method argument, so this cannot wake the car.
+api_get() {
+  local path="$1" token owner_api body complaint
+  : > "$API_ERROR_FILE"
+  token=$(access_token) || { printf 'not signed in' > "$API_ERROR_FILE"; return 2; }
+  owner_api=$(owner_api_for "$token")
+  case "$token" in
+    *[\"\\]*|*[[:space:]]*) printf 'malformed token' > "$API_ERROR_FILE"; return 2 ;;
+  esac
+  case "$path" in
+    *[!A-Za-z0-9_./?=%-]*) printf 'bad request' > "$API_ERROR_FILE"; return 2 ;;
+  esac
+  # The bearer token is a curl config on stdin, not an argument: arguments
+  # are world-readable in /proc for as long as the request runs.
+  body=$(
+    curl -sS -m 12 -X GET --config - \
+      -H "User-Agent: $APP_UA" \
+      -H "X-Tesla-User-Agent: $APP_TAG" \
+      -H "Accept: application/json" \
+      "$owner_api/$path" <<EOF
+header = "Authorization: Bearer ${token}"
+EOF
+  ) || { printf 'cannot reach Tesla' > "$API_ERROR_FILE"; return 1; }
+  complaint=$(printf '%s' "$body" | jq -r '.error // empty' 2>/dev/null) || complaint=""
+  case "$complaint" in
+    "") ;;
+    *fleet-api*|*fleetapi*) printf 'owner API retired for this account' > "$API_ERROR_FILE" ;;
+    *) printf '%s' "$complaint" > "$API_ERROR_FILE" ;;
+  esac
+  printf '%s' "$body"
+}
+
+cmd_token() {
+  local refresh access
+  if [ -t 0 ]; then
+    printf 'Paste the refresh token and press enter.\n' >&2
+  fi
+  IFS= read -r refresh || true
+  refresh=${refresh//[$' \t\r\n"']/}
+  [ -n "$refresh" ] || die "nothing pasted"
+  write_private "$CONFIG_DIR/refresh-token" <<<"$refresh"
+  rm -f "$CONFIG_DIR/access-token" "$CONFIG_DIR/access-token-expires"
+  access=$(mint_access_token "$refresh") || {
+    rm -f "$CONFIG_DIR/refresh-token" "$CONFIG_DIR/access-token" "$CONFIG_DIR/access-token-expires"
+    die "Tesla refused that token. Paste the refresh token, not the access token."
+  }
+  [ -n "$access" ] || die "Tesla refused that token"
+  printf 'Signed in. Token file: %s\nOpen the tesla tile and tap refresh.\n' "$CONFIG_DIR/refresh-token"
+}
+
+vehicle_list() {
+  local cache="$CACHE_DIR/vehicles.json" age response vehicles
+  if [ -r "$cache" ]; then
+    age=$(( $(now) - $(number_or "$(stat -c %Y "$cache" 2>/dev/null || echo 0)" 0) ))
+    if [ "$age" -lt 86400 ]; then cat "$cache"; return 0; fi
+  fi
+  response=$(api_get products) || return 2
+  [ -z "$(api_error)" ] || return 3
+  vehicles=$(printf '%s' "$response" | jq -c '[.response[]? | select(.vin != null and (.vin|type) == "string")]') || return 1
+  if [ "$(printf '%s' "$vehicles" | jq -r 'length')" -le 0 ]; then
+    printf 'no cars on this account' > "$API_ERROR_FILE"
+    return 1
+  fi
+  write_private "$cache" <<<"$vehicles"
+  printf '%s' "$vehicles"
+}
+
+# Build the widget payload from one vehicle_data response. Location fields
+# are dropped on purpose: this tile has no map, and the cache should not
+# become a log of where the car has been.
+reading_json() {
+  jq -c --arg state "$2" --argjson fresh "$3" --arg at "$(now)" --arg fallback "$4" '
+    def flag($v): ($v // 0) != 0;
+    def press($v; $pc): if $v == null or $v <= 0 then null else ($v * $pc * 10 | round / 10) end;
+    . as $r
+    | ($r.gui_settings.gui_distance_units // "km/hr") as $units
+    | (if ($units | startswith("mi")) then 1 else 1.609344 end) as $k
+    | (if ($units | startswith("mi")) then "mi" else "km" end) as $dist
+    | (if ($units | startswith("mi")) then "mph" else "km/h" end) as $speed
+    | (if ($r.gui_settings.gui_range_display // "Rated") == "Ideal"
+       then $r.charge_state.ideal_battery_range else $r.charge_state.battery_range end) as $range
+    | (($r.gui_settings.gui_temperature_units // "C") == "F") as $fahrenheit
+    | (if $fahrenheit then 1.8 else 1 end) as $tc
+    | (if $fahrenheit then 32 else 0 end) as $to
+    | (if $fahrenheit then "°F" else "°C" end) as $tunit
+    | (($r.gui_settings.gui_tirepressure_units // "Bar") | ascii_downcase == "psi") as $psi
+    | (if $psi then 14.5038 else 1 end) as $pc
+    | (if $psi then "psi" else "bar" end) as $punit
+    | press($r.vehicle_state.tpms_pressure_fl; $pc) as $fl
+    | press($r.vehicle_state.tpms_pressure_fr; $pc) as $fr
+    | press($r.vehicle_state.tpms_pressure_rl; $pc) as $rl
+    | press($r.vehicle_state.tpms_pressure_rr; $pc) as $rr
+    | ([$fl, $fr, $rl, $rr] | map(select(. != null))) as $tpms
+    | ([(if (flag($r.vehicle_state.df) or flag($r.vehicle_state.dr)
+            or flag($r.vehicle_state.pf) or flag($r.vehicle_state.pr)) then "door" else empty end),
+        (if flag($r.vehicle_state.ft) then "frunk" else empty end),
+        (if flag($r.vehicle_state.rt) then "trunk" else empty end),
+        (if (flag($r.vehicle_state.fd_window) or flag($r.vehicle_state.fp_window)
+            or flag($r.vehicle_state.rd_window) or flag($r.vehicle_state.rp_window)) then "window" else empty end)]) as $open
+    | {
+        name: (if ($r.vehicle_state.vehicle_name // "") == "" then
+                 (if $fallback == "" then "Tesla" else $fallback end)
+               else $r.vehicle_state.vehicle_name end),
+        vin: $r.vin,
+        car_type: ({"model3":"model 3","modely":"model y","models":"model s","modelx":"model x",
+                    "cybertruck":"cybertruck","semi":"semi"}[$r.vehicle_config.car_type]
+                   // $r.vehicle_config.car_type),
+        trim: ($r.vehicle_config.trim_badging // null),
+        state: $state,
+        fresh: $fresh,
+        at: ($at|tonumber),
+        shift: ($r.drive_state.shift_state // "P"),
+        driving: (($r.drive_state.shift_state // "P") != "P" and ($r.drive_state.shift_state // null) != null),
+        speed: (if $r.drive_state.speed == null then null else ($r.drive_state.speed * $k | round) end),
+        speed_unit: $speed,
+        destination: (($r.drive_state.active_route_destination // "") | if . == "" then null else . end),
+        eta: (if $r.drive_state.active_route_minutes_to_arrival == null then null
+              else (($at|tonumber) + ($r.drive_state.active_route_minutes_to_arrival * 60) | round) end),
+        battery: $r.charge_state.battery_level,
+        charge_limit: $r.charge_state.charge_limit_soc,
+        charging: ($r.charge_state.charging_state // "Unknown"),
+        charger_power: (if $r.charge_state.charging_state == "Charging" then $r.charge_state.charger_power else null end),
+        energy_added: (if $r.charge_state.charging_state == "Charging" then
+                        (if $r.charge_state.charge_energy_added == null then null
+                         else ($r.charge_state.charge_energy_added * 10 | round / 10) end) else null end),
+        minutes_to_full: (if $r.charge_state.charging_state == "Charging" then $r.charge_state.minutes_to_full_charge else null end),
+        range: (if $range == null then null else ($range * $k * 10 | round / 10) end),
+        range_unit: $dist,
+        odometer: (if $r.vehicle_state.odometer == null then null else ($r.vehicle_state.odometer * $k | round) end),
+        locked: $r.vehicle_state.locked,
+        sentry: $r.vehicle_state.sentry_mode,
+        climate_on: $r.climate_state.is_climate_on,
+        inside_temp: (if $r.climate_state.inside_temp == null then null else ($r.climate_state.inside_temp * $tc + $to | round) end),
+        outside_temp: (if $r.climate_state.outside_temp == null then null else ($r.climate_state.outside_temp * $tc + $to | round) end),
+        temp_unit: $tunit,
+        tyres: ($tpms | if length == 0 then null else {min: (min * 10 | round / 10), max: (max * 10 | round / 10)} end),
+        tyre_fl: $fl,
+        tyre_fr: $fr,
+        tyre_rl: $rl,
+        tyre_rr: $rr,
+        tyre_unit: $punit,
+        software: (($r.vehicle_state.car_version // "") | if . == "" then null else split(" ")[0] end),
+        # car_version is the firmware. An FSD package version is not part of
+        # this reading; keep a string only when one is actually present.
+        performance_package: (
+          ($r.vehicle_config.performance_package // null) as $p
+          | if $p == null or ($p|type) != "string" then null
+            elif ($p|ascii_downcase) == "" or ($p|ascii_downcase) == "base" then null
+            else $p end),
+        fsd: (
+          [ $r.vehicle_state.fsd_version, $r.vehicle_state.autopilot_version,
+            $r.vehicle_config.fsd_version, $r.vehicle_config.autopilot_version ]
+          | map(if type == "string" then gsub("^\\s+|\\s+$";"") else "" end)
+          | map(select(. != ""))
+          | .[0] // null),
+        open: $open
+      }' <<<"$1"
+}
+
+cache_path_for() {
+  printf '%s/cars/%s.json' "$CACHE_DIR" "$1"
+}
+
+emit() {
+  local reading="$1" state="$2" fresh="$3" age="$4" note="$5" vehicles="$6" error="$7" hint="$8"
+  local json
+  json=$(jq -cn \
+    --argjson reading "${reading:-null}" \
+    --argjson vehicles "$vehicles" \
+    --arg state "$state" \
+    --argjson fresh "$fresh" \
+    --arg atage "$age" \
+    --arg note "$note" \
+    --arg error "$error" \
+    --arg hint "$hint" \
+    '{ready: true, state: $state, fresh: $fresh,
+      age: (if $atage == "" then null else ($atage|tonumber) end),
+      note: (if $note == "" then null else $note end),
+      error: (if $error == "" then null else $error end),
+      hint: (if $hint == "" then null else $hint end),
+      vehicles: $vehicles} + (if $reading == null then {} else $reading end)
+    | .state = $state | .fresh = $fresh') || fail_json "bad reading"
+  write_private "$CACHE_DIR/last.json" <<<"$json"
+  printf '%s\n' "$json"
+}
+
+cmd_status() {
+  local which="${1:-auto}" nonce="${2:-0}"
+  if [ "$which" != "auto" ]; then
+    case "$which" in
+      *[!A-HJ-NPR-Z0-9]*) fail_json "bad vin" ;;
+    esac
+    [ "${#which}" -eq 17 ] || fail_json "bad vin"
+  fi
+  case "$nonce" in
+    ''|*[!0-9]*) nonce=0 ;;
+  esac
+
+  local fixture="$CONFIG_DIR/fixture.json"
+  if [ -s "$fixture" ]; then
+    jq -c --arg at "$(now)" '
+      ($at|tonumber) as $now
+      | . + {ready: true, fixture: true, fresh: true, at: $now, age: 0} | del(.ok)' "$fixture"
+    return 0
+  fi
+
+  exec 9>"$CACHE_DIR/.lock"
+  if ! flock -n 9; then
+    if [ -s "$CACHE_DIR/last.json" ]; then
+      if [ "$which" = "auto" ] || [ "$(jq -r '.vin // empty' "$CACHE_DIR/last.json")" = "$which" ]; then
+        cat "$CACHE_DIR/last.json"
+        return 0
+      fi
+    fi
+    fail_json "busy" "another reading is still running"
+  fi
+
+  local force=0 prev=""
+  if [ -f "$CACHE_DIR/nonce" ]; then
+    prev=$(read_first_line "$CACHE_DIR/nonce" 2>/dev/null || true)
+    if [ "$nonce" != "0" ] && [ "$nonce" != "$prev" ]; then force=1; fi
+  fi
+  write_private "$CACHE_DIR/nonce" <<<"$nonce"
+
+  if ! refresh_token >/dev/null && ! { [ -n "$(read_first_line "$CONFIG_DIR/access-token" 2>/dev/null || true)" ]; }; then
+    fail_json "not signed in" "paste a refresh token with: tesla-status token"
+  fi
+
+  local vehicles vehicle
+  vehicles=$(vehicle_list) || fail_json "$(api_error)" "$(api_hint)"
+  [ -n "$vehicles" ] || fail_json "no cars on this account"
+  vehicle=$(printf '%s' "$vehicles" | jq -c --arg vin "$which" '
+    if $vin == "auto" then .[0] else (map(select(.vin == $vin)) | .[0]) end // empty') || vehicle=""
+  [ -n "$vehicle" ] || fail_json "car not found" "that vin is not on this account"
+  local id vin name names
+  id=$(printf '%s' "$vehicle" | jq -r '.id_s // (.id|tostring)')
+  case "$id" in
+    ''|*[!0-9]*) fail_json "bad vehicle id" ;;
+  esac
+  vin=$(printf '%s' "$vehicle" | jq -r '.vin')
+  name=$(printf '%s' "$vehicle" | jq -r 'if (.display_name // "") == "" then "Tesla" else .display_name end')
+  names=$(printf '%s' "$vehicles" | jq -c 'map({vin, name: (if (.display_name // "") == "" then "Tesla" else .display_name end)})')
+
+  local summary state
+  summary=$(api_get "vehicles/$id") || {
+    local cached=""
+    [ -r "$(cache_path_for "$vin")" ] && cached=$(cat "$(cache_path_for "$vin")")
+    emit "$cached" "unknown" false "" "" "$names" "$(api_error)" "$(api_hint)"
+    return 0
+  }
+  if [ -n "$(api_error)" ]; then
+    local cached=""
+    [ -r "$(cache_path_for "$vin")" ] && cached=$(cat "$(cache_path_for "$vin")")
+    if [ -n "$cached" ]; then
+      emit "$cached" "unknown" false "" "" "$names" "$(api_error)" "$(api_hint)"
+    else
+      fail_json "$(api_error)" "$(api_hint)"
+    fi
+    return 0
+  fi
+  state=$(printf '%s' "$summary" | jq -r '.response.state // empty' 2>/dev/null) || state=""
+  [ -n "$state" ] || state=$(printf '%s' "$vehicle" | jq -r '.state // "unknown"')
+
+  local cache cached=""
+  cache=$(cache_path_for "$vin")
+  [ -r "$cache" ] && cached=$(cat "$cache")
+  if [ -z "$cached" ]; then
+    cached=$(jq -cn --arg name "$name" --arg vin "$vin" '{name: $name, vin: $vin}')
+  fi
+
+  local note=""
+  if [ "$state" != "online" ]; then
+    [ "$force" -eq 1 ] && note="not awake, so this is the last reading"
+    local age=""
+    if printf '%s' "$cached" | jq -e '.at' >/dev/null 2>&1; then
+      age=$(( $(now) - $(number_or "$(printf '%s' "$cached" | jq -r '.at // empty')" 0) ))
+    fi
+    emit "$cached" "$state" false "$age" "$note" "$names" "" ""
+    return 0
+  fi
+
+  if [ "$force" -ne 1 ] && [ -n "$cached" ]; then
+    local age driving charging throttle
+    age=$(( $(now) - $(number_or "$(printf '%s' "$cached" | jq -r '.at // empty')" 0) ))
+    driving=$(printf '%s' "$cached" | jq -r '.driving // false')
+    charging=$(printf '%s' "$cached" | jq -r '.charging // "Unknown"')
+    throttle=$PARK_THROTTLE
+    [ "$charging" = "Charging" ] && throttle=$CHARGE_THROTTLE
+    [ "$driving" = "true" ] && throttle=$DRIVE_THROTTLE
+    if [ "$age" -lt "$throttle" ]; then
+      emit "$cached" "$state" false "$age" "" "$names" "" ""
+      return 0
+    fi
+  fi
+
+  local response raw
+  response=$(api_get "vehicles/$id/vehicle_data?endpoints=drive_state%3Bcharge_state%3Bgui_settings%3Bvehicle_state%3Bvehicle_config%3Bclimate_state") || {
+    emit "$cached" "$state" false "" "" "$names" "$(api_error)" "$(api_hint)"
+    return 0
+  }
+  raw=$(printf '%s' "$response" | jq -c '.response // empty' 2>/dev/null) || raw=""
+  if [ -z "$raw" ] || ! printf '%s' "$raw" | jq -e '.charge_state and .drive_state' >/dev/null 2>&1; then
+    # 408, or a car that just fell asleep. Do not retry: retrying is how a
+    # tile wakes a car that was on its way to sleep.
+    [ "$force" -eq 1 ] && note="not awake, so this is the last reading"
+    emit "$cached" "asleep" false "" "$note" "$names" "" ""
+    return 0
+  fi
+
+  local reading
+  reading=$(reading_json "$raw" "$state" true "$name") || fail_json "bad reading"
+  write_private "$cache" <<<"$reading"
+  emit "$reading" "$state" true 0 "" "$names" "" ""
+}
+
+case "${1:-status}" in
+  status) shift; cmd_status "$@" ;;
+  token) cmd_token ;;
+  *) fail_json "unknown command" ;;
+esac

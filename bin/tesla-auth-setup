@@ -1,0 +1,71 @@
+#!/bin/bash
+# Optional helper for the Tesla tile. It is separate from the widget.
+# On this phone it installs Tesla Auth if needed, then opens Tesla's own login.
+# It does not pass --debug, and it never reads or prints a token.
+set -uo pipefail
+umask 077
+
+home="${HOME:-/root}"
+root="$home/.local/opt/tesla_auth-aarch64-unknown-linux-gnu"
+bin="$root/tesla_auth"
+libdir="$home/.local/lib"
+opener="$home/.local/bin/tesla-auth-open"
+url="https://github.com/adriankumpf/tesla_auth/releases/latest/download/tesla_auth-aarch64-unknown-linux-gnu.tar.xz"
+releases="https://github.com/adriankumpf/tesla_auth/releases/latest"
+
+die() { printf 'tesla-auth-setup: %s\n' "$*" >&2; exit 1; }
+
+if [ "$(uname -m)" != "aarch64" ]; then
+  die "this helper is for the phone. On a computer, download Tesla Auth from ${releases}"
+fi
+
+missing=""
+pacman -Q webkit2gtk-4.1 >/dev/null 2>&1 || missing="webkit2gtk-4.1"
+pacman -Q xdotool >/dev/null 2>&1 || missing="${missing:+$missing }xdotool"
+if [ -n "$missing" ]; then
+  die "install these first, then run this again: pacman -S --needed ${missing}"
+fi
+
+if [ ! -x "$bin" ]; then
+  command -v curl >/dev/null 2>&1 || die "curl is required"
+  command -v tar >/dev/null 2>&1 || die "tar is required"
+  tmp=$(mktemp -d)
+  trap 'rm -rf "$tmp"' EXIT
+  printf 'Downloading Tesla Auth for this phone...\n'
+  curl -fL --retry 2 -o "$tmp/tesla_auth.tar.xz" "$url" || die "download failed. Use ${releases} instead."
+  tar -tJf "$tmp/tesla_auth.tar.xz" >/dev/null 2>&1 || die "download was not a valid archive"
+  mkdir -p "$tmp/out" "$home/.local/opt"
+  tar -xJf "$tmp/tesla_auth.tar.xz" -C "$tmp/out"
+  found=$(find "$tmp/out" -type f -name tesla_auth | head -n 1)
+  [ -n "$found" ] || die "archive did not contain tesla_auth"
+  rm -rf "$root"
+  mv "$(dirname "$found")" "$root"
+  chmod 755 "$bin" || die "could not install Tesla Auth"
+  printf 'Installed %s\n' "$bin"
+fi
+
+if [ ! -e "$libdir/libxdo.so.3" ] && [ -e /usr/lib/libxdo.so.4 ]; then
+  mkdir -p "$libdir"
+  ln -s /usr/lib/libxdo.so.4 "$libdir/libxdo.so.3"
+fi
+
+if [ ! -x "$opener" ]; then
+  mkdir -p "$(dirname "$opener")"
+  cat > "$opener" << 'EOF'
+#!/bin/bash
+# Open tesla_auth on this phone. The login page is Tesla's own site.
+# Do not pass --debug: it prints navigation URLs that can include the auth code.
+export LD_LIBRARY_PATH="${HOME}/.local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export WEBKIT_DISABLE_COMPOSITING_MODE=1
+export WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1
+export GDK_BACKEND="${GDK_BACKEND:-wayland}"
+export VK_ICD_FILENAMES="${VK_ICD_FILENAMES:-/usr/share/vulkan/icd.d/panfrost_icd.aarch64.json}"
+export MESA_VK_WSI_DEBUG="${MESA_VK_WSI_DEBUG:-sw}"
+export GALLIUM_DRIVER="${GALLIUM_DRIVER:-zink}"
+unset LIBGL_ALWAYS_SOFTWARE
+exec dbus-run-session -- "${HOME}/.local/opt/tesla_auth-aarch64-unknown-linux-gnu/tesla_auth" "$@"
+EOF
+  chmod 755 "$opener"
+fi
+
+exec "$opener"

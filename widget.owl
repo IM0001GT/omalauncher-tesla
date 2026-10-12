@@ -1,0 +1,322 @@
+widget "tesla" {
+  page: 2
+  order: 0
+  size: 3x3
+  minSize: 3x3
+  meta {
+    description: "Read-only Tesla status: battery, range, lock, climate and charge. It never wakes the car."
+    version: "1.3"
+    license: "MIT"
+    category: "home"
+    owl: 5
+  }
+  requires { pacman: ["curl", "jq", "openssl"] }
+
+  // Which car, and a counter the refresh button bumps. The script treats a new
+  // counter as one forced reading, then goes back to leaving a parked car alone.
+  state vin = "" persist
+  state nonce = 0 persist
+  let picked = match(vin ?? "", "^([A-HJ-NPR-Z0-9]{17})$")
+  let which = picked == null ? "auto" : picked[0]
+  let tickM = match(str(nonce ?? 0), "^([0-9]{1,12})$")
+  let tick = tickM == null ? "0" : tickM[0]
+  source src = cmd("~/.local/bin/tesla-status status ${which} ${tick}") every 60s json timeout 25s status
+
+  // `status` reports whether the command ran. `ready` is the script's own flag,
+  // kept off `ok` so a signed-out payload is not treated as a crashed command.
+  let body = src != null && src.ok ? src.out : null
+  let car = body != null && body.ready ? body : null
+  let fault = src == null ? null : !src.ok ? (src.code == 124 ? "timed out" : "offline") : body == null ? "bad reading" : body.ready ? null : (body.error ?? "unavailable")
+  let hint = body.hint
+  let phase = car == null ? null : car.driving ? "driving" : car.charging == "Charging" ? "charging" : car.charging == "Complete" ? "charged" : car.state == "asleep" ? "asleep" : car.state == "offline" ? "offline" : car.state == "online" ? "parked" : (car.state ?? "…")
+  let phaseColor = car == null ? muted : car.driving ? green : car.charging == "Charging" ? cyan : muted
+  let low = car.battery != null && car.battery <= 15
+  let mid = car.battery != null && car.battery <= 30
+  let ringColor = car == null ? muted : car.state != "online" ? muted : car.charging == "Charging" ? green : low ? red : mid ? yellow : accent
+  let lockWord = car.locked == null ? "" : car.locked ? "locked" : "unlocked"
+  let lockText = car.locked == null ? "…" : lockWord
+  let lockTint = car.locked == false ? yellow : foreground
+  let rangeText = car.range == null ? null : "${round(car.range)} ${car.range_unit}"
+  let chargingNow = car.charging == "Charging"
+  let heroMid = car == null ? null : car.driving ? "${round(car.speed ?? 0)} ${car.speed_unit ?? ""}" : chargingNow ? "${round(car.charger_power ?? 0)} kW" : (rangeText ?? "…")
+  let heroMidColor = car == null ? foreground : car.driving ? green : chargingNow ? cyan : foreground
+  let heroFoot = car == null ? null : car.driving ? (car.destination != null ? "${car.destination}${car.eta == null ? "" : " · ${fmtTime(car.eta, "HH:mm")}"}" : (rangeText ?? "")) : chargingNow ? (rangeText == null ? (car.minutes_to_full == null ? "" : "${round(car.minutes_to_full)}m") : car.minutes_to_full == null ? rangeText : "${rangeText} · ${round(car.minutes_to_full)}m") : ""
+  let heroFootColor = muted
+  let ageN = car.age
+  let ago = car == null || car.at == null ? null : ageN == null || ageN < 45 ? "just now" : ageN < 3600 ? "${floor(ageN / 60)}m ago" : ageN < 86400 ? "${floor(ageN / 3600)}h ago" : "${floor(ageN / 86400)}d ago"
+  let carName = car.name == null || car.name == "" ? "Tesla" : car.name
+  let statusLine = ago == null ? phase : "${phase} · ${ago}"
+  let openCount = count(car.open ?? [])
+  let opened = openCount > 0 ? join((car.open ?? []).map(part => part == "boot" ? "trunk" : part), ", ") : null
+  let cars = car.vehicles ?? []
+  let inside = car.inside_temp == null ? "…" : "${car.inside_temp}°"
+  let outside = car.outside_temp == null ? "…" : "${car.outside_temp}°"
+  let hot = car.inside_temp != null && (car.temp_unit == "°F" ? car.inside_temp >= 84 : car.inside_temp >= 29)
+  let cold = car.inside_temp != null && (car.temp_unit == "°F" ? car.inside_temp <= 45 : car.inside_temp <= 7)
+  let insideTint = hot ? yellow : cold ? blue : foreground
+  let sentryText = car.sentry == null ? "…" : car.sentry ? "on" : "off"
+  let climateText = car.climate_on == null ? "…" : car.climate_on ? "on" : "off"
+  let tyreShort = car.tyres == null ? "…" : "${round(car.tyres.min)}–${round(car.tyres.max)}"
+  let tyreText = car.tyres == null ? "…" : "${car.tyres.min}–${car.tyres.max} ${car.tyre_unit ?? ""}"
+  let tyreSpread = car.tyres == null ? 0 : car.tyres.max - car.tyres.min
+  let tyreTint = car.tyres != null && (car.tyre_unit == "psi" ? tyreSpread >= 3 : tyreSpread >= 0.2) ? yellow : foreground
+  let roomy = rows != null && rows >= 4
+  let sideLabel = chargingNow ? "charge" : car.sentry == true ? "sentry" : "climate"
+  let sideValue = chargingNow ? "${round(car.charger_power ?? 0)} kW" : car.sentry == true ? "on" : climateText
+  let sideTint = chargingNow ? cyan : car.sentry == true ? yellow : car.climate_on == true ? cyan : foreground
+  let extraLabel = car.sentry == true && !chargingNow ? "climate" : "sentry"
+  let extraValue = car.sentry == true && !chargingNow ? climateText : sentryText
+  let extraTint = car.sentry == true && !chargingNow ? (car.climate_on == true ? cyan : foreground) : car.sentry == true ? yellow : foreground
+  let attention = opened != null ? "${opened} open" : null
+  let attentionColor = opened != null ? red : yellow
+  // VIN position 10 is the model year (letters skip I, O, Q, U, Z). The badge
+  // "p74d" is Performance + pack code + dual motor, not the name on the car.
+  let yearByCode = { A: 2010, B: 2011, C: 2012, D: 2013, E: 2014, F: 2015, G: 2016, H: 2017, J: 2018, K: 2019, L: 2020, M: 2021, N: 2022, P: 2023, R: 2024, S: 2025, T: 2026, V: 2027, W: 2028, X: 2029, Y: 2030 }
+  let yearCode = car == null || car.vin == null ? "" : upper(sub(str(car.vin), 9, 10))
+  let modelYear = get(yearByCode, yearCode, null)
+  let typeRaw = car.car_type ?? ""
+  let typeName = typeRaw == "" ? "" : "${upper(sub(typeRaw, 0, 1))}${sub(typeRaw, 1, len(typeRaw))}"
+  let badge = lower(car.trim ?? "")
+  let pack = car.performance_package ?? ""
+  let grade = pack != "" && lower(pack) != "base" ? pack : contains(badge, "plaid") ? "Plaid" : (startsWith(badge, "p") || badge == "performance") ? "Performance" : (endsWith(badge, "d") && match(badge, "[0-9]") != null) ? "Long Range" : ""
+  let translated = join([modelYear == null ? "" : str(modelYear), typeName, grade].filter(part => part != ""), " ")
+  let trimCode = car.trim ?? ""
+  let identity = car == null ? "" : trimCode == "" ? translated : translated == "" ? trimCode : "${translated} - ${trimCode}"
+  let softwareLine = car.software == null && (car.fsd == null || car.fsd == "") ? "" : car.fsd == null || car.fsd == "" ? "software ${car.software}" : car.software == null ? "fsd ${car.fsd}" : "software ${car.software} · fsd ${car.fsd}"
+  let tyresKnown = car.tyre_fl != null || car.tyre_fr != null || car.tyre_rl != null || car.tyre_rr != null
+  let pct = car.battery == null ? "…" : "${round(car.battery)}%"
+  onTap: screen()
+
+  component Rule() {
+    Spacer { height: 1; fill: width; background: alpha(muted, 0.25) }
+  }
+
+  component Fact(label, value, tint = foreground) {
+    Column {
+      gap: 1
+      Text { text: label; style: label; color: muted; maxLines: 1 }
+      Text { text: value; style: small; color: tint; maxLines: 1 }
+    }
+  }
+
+  component Card(label, value, tint = foreground) {
+    Column {
+      gap: 2
+      padding: [12, 10]
+      border: 1
+      borderColor: alpha(muted, 0.3)
+      Text { text: label; style: label; color: muted; maxLines: 1 }
+      Text { text: value; style: body; color: tint; maxLines: 2 }
+    }
+  }
+
+  component ChargeLine(big) {
+    Column {
+      gap: 0
+      Text { text: pct; fontSize: big; color: ringColor; maxLines: 1 }
+      if car.charge_limit != null {
+        Text { text: "- ${round(car.charge_limit)}%"; style: small; color: muted; maxLines: 1 }
+      }
+    }
+  }
+
+  component Corner(label, value, tint = foreground) {
+    Column {
+      gap: 1
+      padding: [8, 8]
+      border: 1
+      borderColor: alpha(muted, 0.3)
+      align: center
+      Text { text: label; style: label; color: muted; align: center; maxLines: 1 }
+      Text { text: value == null ? "…" : "${value}"; style: body; color: tint; align: center; maxLines: 1 }
+    }
+  }
+
+  if car == null {
+    Column {
+      gap: 6
+      fill: true
+      justify: center
+      Text { text: "tesla"; style: label; color: accent }
+      Text { text: fault ?? "…"; style: title; maxLines: 2 }
+      Text { text: fault == null ? "" : "tap for what to do"; style: small; color: muted; maxLines: 1 }
+    }
+  } else {
+    Column {
+      gap: 0
+      fill: true
+      Text { text: carName; maxLines: 1 }
+      Text { text: statusLine; style: label; color: phaseColor; maxLines: 1 }
+      Spacer { height: 8 }
+      Row {
+        gap: 14
+        align: center
+        Ring {
+          value: car.battery ?? 0
+          max: 100
+          size: roomy ? 120 : 104
+          thickness: 8
+          color: ringColor
+          track: alpha(muted, 0.25)
+          animate value: spring()
+        }
+        Column {
+          gap: 0
+          weight: 1
+          ChargeLine { big: 32 }
+          Text { text: heroMid; color: heroMidColor; maxLines: 1 }
+          if heroFoot != null && heroFoot != "" {
+            Text { text: heroFoot; style: small; color: heroFootColor; maxLines: 1 }
+          }
+        }
+      }
+      if roomy { Spacer { weight: 1 } } else { Spacer { height: 12 } }
+      Rule {}
+      Spacer { height: 10 }
+      Row {
+        gap: 8
+        Fact { label: "inside"; value: inside; tint: insideTint; weight: 1 }
+        Fact { label: "outside"; value: outside; weight: 1 }
+        Fact { label: sideLabel; value: sideValue; tint: sideTint; weight: 1 }
+      }
+      Spacer { height: 10 }
+      Row {
+        gap: 8
+        Fact { label: extraLabel; value: extraValue; tint: extraTint; weight: 1 }
+        Fact { label: "lock"; value: lockText; tint: lockTint; weight: 1 }
+        Fact { label: "tires"; value: tyreShort; tint: tyreTint; weight: 1 }
+      }
+      if attention != null {
+        Spacer { height: 8 }
+        Text { text: attention; style: small; color: attentionColor; maxLines: 2 }
+      }
+    }
+  }
+
+  screen {
+    title: car == null ? "tesla" : carName
+    Column {
+      gap: 14
+      scroll: true
+      if car == null {
+        Text { text: fault ?? "…"; style: title; maxLines: 2 }
+        if fault == "not signed in" {
+          Text { text: "This tile only reads the car, and it will not wake it. It needs a refresh token from Tesla Auth. That token is the whole Tesla account. You type your own password and MFA. Copy the refresh token, not the access token."; style: small }
+          Text { text: "On a computer"; style: label; color: accent }
+          Text { text: "Download Tesla Auth for that computer, run it, and sign in on Tesla's own page. On the last window, copy the refresh token. Then paste it here."; style: small }
+          Button { text: "Tesla Auth downloads"; onTap: url("https://github.com/adriankumpf/tesla_auth/releases/latest") }
+          Text { text: "On this phone"; style: label; color: accent }
+          Text { text: "The same login can run here. An optional script, separate from this tile, installs the helper and opens it. After either way, paste the refresh token below. It is saved as ~/.config/omarchy-tesla/refresh-token and nowhere else."; style: small }
+          Button { text: "phone helper"; onTap: terminal("bash ~/.local/bin/tesla-auth-setup", "tesla auth") }
+          Button { text: "sign in on this phone"; color: accent; onTap: app("tesla-auth-open") }
+          Button { text: "paste token"; onTap: terminal("~/.local/bin/tesla-status token", "tesla") }
+          Text { text: "If the car is asleep, the first numbers wait until it is already awake."; style: small; color: muted }
+        } else {
+          Text { text: hint ?? "could not reach Tesla"; style: small; color: muted }
+        }
+        Button { text: "check again"; onTap: refresh() }
+      } else {
+        Row {
+          gap: 16
+          align: center
+          Ring {
+            value: car.battery ?? 0
+            max: 100
+            size: 104
+            thickness: 8
+            color: ringColor
+            track: alpha(muted, 0.25)
+            animate value: spring()
+          }
+          Column {
+            gap: 0
+            weight: 1
+            ChargeLine { big: 40 }
+            Text { text: heroMid; style: title; color: heroMidColor; maxLines: 1 }
+            Text { text: "${phase}${ago == null ? "" : " · ${ago}"}"; style: small; color: phaseColor; maxLines: 1 }
+            if heroFoot != null && heroFoot != "" {
+              Text { text: heroFoot; style: small; color: heroFootColor; maxLines: 2 }
+            }
+          }
+        }
+        if identity != "" {
+          Text { text: identity; style: small; color: muted; maxLines: 1 }
+        }
+        if car.note != null {
+          Text { text: car.note; style: small; color: muted; maxLines: 2 }
+        }
+        if car.error != null {
+          Text { text: car.error; style: small; color: yellow; maxLines: 2 }
+        }
+        if opened != null {
+          Text { text: "${opened} open"; style: body; color: red; maxLines: 2 }
+        }
+        Rule {}
+        Grid {
+          columns: 2
+          gap: 8
+          Card { label: "inside"; value: inside; tint: insideTint }
+          Card { label: "outside"; value: outside }
+          Card { label: "lock"; value: car.locked == null ? "…" : lockWord; tint: car.locked == false ? yellow : foreground }
+          Card { label: "sentry"; value: sentryText; tint: car.sentry == true ? yellow : foreground }
+          Card { label: "climate"; value: climateText; tint: car.climate_on == true ? cyan : foreground }
+          if !tyresKnown && car.tyres != null {
+            Card { label: "tires"; value: tyreText; tint: tyreTint }
+          }
+          if car.odometer != null {
+            Card { label: "odometer"; value: "${car.odometer} ${car.range_unit ?? ""}" }
+          }
+        }
+        if tyresKnown {
+          Text { text: "tires ${car.tyre_unit ?? ""}"; style: label; color: accent }
+          Row {
+            gap: 8
+            Corner { label: "fl"; value: car.tyre_fl; tint: tyreTint == yellow && car.tyre_fl == car.tyres.min ? yellow : foreground; weight: 1 }
+            Corner { label: "fr"; value: car.tyre_fr; tint: tyreTint == yellow && car.tyre_fr == car.tyres.min ? yellow : foreground; weight: 1 }
+            Corner { label: "rl"; value: car.tyre_rl; tint: tyreTint == yellow && car.tyre_rl == car.tyres.min ? yellow : foreground; weight: 1 }
+            Corner { label: "rr"; value: car.tyre_rr; tint: tyreTint == yellow && car.tyre_rr == car.tyres.min ? yellow : foreground; weight: 1 }
+          }
+        }
+        if chargingNow {
+          Text { text: "charging"; style: label; color: accent }
+          Row {
+            gap: 8
+            Card { label: "power"; value: "${round(car.charger_power ?? 0)} kW"; tint: cyan; weight: 1 }
+            Card { label: "full in"; value: car.minutes_to_full == null ? "…" : "${round(car.minutes_to_full)}m"; weight: 1 }
+            Card { label: "added"; value: car.energy_added == null ? "…" : "${car.energy_added} kWh"; weight: 1 }
+          }
+        }
+        if car.driving && car.destination != null {
+          Text { text: "route"; style: label; color: accent }
+          Row {
+            gap: 8
+            Card { label: "going"; value: car.destination; weight: 1 }
+            Card { label: "arrives"; value: car.eta == null ? "…" : fmtTime(car.eta, "HH:mm"); weight: 1 }
+          }
+        }
+        if softwareLine != "" {
+          Text { text: softwareLine; style: small; color: muted; maxLines: 2 }
+        }
+        if count(cars) > 1 {
+          Text { text: "cars"; style: label; color: accent }
+          Flow {
+            gap: 6
+            for v in cars key v.vin {
+              Button {
+                text: v.name
+                color: v.vin == car.vin ? accent : foreground
+                onTap: { vin = v.vin; nonce = nonce + 1; refresh() }
+              }
+            }
+          }
+        }
+        Row {
+          gap: 8
+          Button { text: "refresh"; color: accent; onTap: { nonce = nonce + 1; refresh() } }
+          Button { text: "open app"; onTap: androidApp("com.teslamotors.tesla") }
+        }
+        Text { text: "Refresh reads the car only if it is already awake. A parked car is left alone for 15 minutes, and nothing here can wake it."; style: small; color: muted }
+      }
+    }
+  }
+}

@@ -1,0 +1,13 @@
+#!/bin/bash
+# Open tesla_auth on this phone. The login page is Tesla's own site.
+# Do not pass --debug: it prints navigation URLs that can include the auth code.
+export LD_LIBRARY_PATH="${HOME}/.local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export WEBKIT_DISABLE_COMPOSITING_MODE=1
+export WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1
+export GDK_BACKEND="${GDK_BACKEND:-wayland}"
+export VK_ICD_FILENAMES="${VK_ICD_FILENAMES:-/usr/share/vulkan/icd.d/panfrost_icd.aarch64.json}"
+export MESA_VK_WSI_DEBUG="${MESA_VK_WSI_DEBUG:-sw}"
+export GALLIUM_DRIVER="${GALLIUM_DRIVER:-zink}"
+# The previous default forced a CPU Vulkan device. panvk has none, so EGL aborted.
+unset LIBGL_ALWAYS_SOFTWARE
+exec dbus-run-session -- "${HOME}/.local/opt/tesla_auth-aarch64-unknown-linux-gnu/tesla_auth" "$@"

@@ -1,0 +1,7 @@
+# Never commit a Tesla token, a car cache, or a live tile screenshot.
+refresh-token
+access-token
+access-token-expires
+fixture.json
+*.png
+.preview/
